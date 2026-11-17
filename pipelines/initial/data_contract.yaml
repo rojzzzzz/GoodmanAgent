@@ -1,0 +1,319 @@
+contract_version: "1.0.0"
+name: goodman_digesto_v1
+stage: after_transform_before_load
+producer: pipelines.transform.extract_data
+sql_schema: ../database/schema.sql
+scope:
+  source: digesto
+  extraction_operation: getNormaHtmlAccordion
+  current_state_only: true
+  tables: [legal_instruments, document_nodes]
+  note: Extraction status describes technical quality, not legal force.
+
+input:
+  type: mapping_of_pandas_dataframes
+  required_keys: [legal_instruments, document_nodes]
+  allow_extra_keys: false
+  columns_must_match_contract: true
+  column_order_significant: false
+  allow_empty_tables: true
+  note: Empty batches retain the declared columns and never mean delete existing data.
+
+normalization:
+  missing_values:
+    pandas: [null, NaN, NaT, pd.NA]
+    database: SQL_NULL
+    rule: Convert missing pandas scalars to Python None before binding SQL parameters.
+    restrictions:
+      - Do not replace unknown legal dates with today, an epoch, or another legal date.
+      - Do not convert intentionally empty failed-response text into missing text.
+      - Reject NaN and Infinity inside JSON values; use JSON null when appropriate.
+  legal_dates:
+    source_format: "%d/%m/%Y"
+    python_type: datetime.date
+    allow_datetime_values: false
+    sql_type: DATE
+    empty_source_value: null
+    invalid_nonempty_value: error
+    note: Do not infer commencement from approval or publication dates.
+  observation_times:
+    python_type: timezone_aware_datetime_or_pandas_timestamp
+    timezone: UTC
+    sql_type: TIMESTAMPTZ
+    invalid_or_missing_required_value: error
+    note: Metadata and text are fetched independently; neither timestamp must precede the other.
+  text:
+    encoding: UTF-8
+    preserve_exact_transformed_text: true
+    forbidden_characters: ["U+0000", "U+FFFD"]
+    note: Do not strip, case-fold, Unicode-normalize, or change line endings after computing hashes and offsets.
+  integers:
+    rule: Accept integers or finite whole-number floats introduced by pandas joins, reject booleans/fractions, and bind Python int values to SQL.
+
+tables:
+  legal_instruments:
+    grain: One current instrument per source and native source ID.
+    business_key: [source, source_id]
+    database_generated:
+      id: {sql_type: BIGINT, generation: identity, primary_key: true}
+    columns:
+      source: {type: string, sql_type: TEXT, nullable: false, allowed_values: [digesto]}
+      source_id:
+        type: string
+        sql_type: TEXT
+        nullable: false
+        non_blank: true
+        strip_whitespace_allowed: false
+        source_field: iunpid
+        note: Validate strict Base64 decoding to an ASCII positive integer. Zero is the summary row.
+      categoria: {type: string, sql_type: TEXT, nullable: true}
+      numero:
+        type: string
+        sql_type: TEXT
+        nullable: true
+        note: Preserve leading zeroes and s/n. Numbers are not unique instrument identifiers.
+      rango: {type: string, sql_type: TEXT, nullable: true}
+      titulo: {type: string, sql_type: TEXT, nullable: false, non_blank: true}
+      fecha_aprobacion: {type: date, sql_type: DATE, nullable: true, source_field: fechaAprobacion}
+      fecha_publicacion: {type: date, sql_type: DATE, nullable: true, source_field: fechaPublicacion}
+      url:
+        type: string
+        sql_type: TEXT
+        nullable: false
+        non_blank: true
+        allowed_schemes: [https, http]
+        allowed_hosts: [digesto.asamblea.gob.ni]
+        note: Absolute source URL with a hostname; reject whitespace and control characters.
+      metadata_fetched_at: {type: timestamp, sql_type: TIMESTAMPTZ, nullable: false}
+      text: {type: string, sql_type: TEXT, nullable: true, conditional: extraction_state}
+      text_sha256:
+        type: string
+        sql_type: TEXT
+        nullable: true
+        pattern: '^[0-9a-f]{64}$'
+        conditional: extraction_state
+      text_chars: {type: integer, sql_type: INTEGER, nullable: true, minimum: 0, maximum: 2147483647, conditional: extraction_state}
+      extraction_status:
+        type: string
+        sql_type: TEXT
+        nullable: false
+        allowed_values: [not_attempted, ok, empty_response, no_usable_text, needs_review, http_error]
+      status_reason: {type: string, sql_type: TEXT, nullable: true, conditional: extraction_state}
+      text_fetched_at: {type: timestamp, sql_type: TIMESTAMPTZ, nullable: true, conditional: extraction_state}
+      extractor_version:
+        type: string
+        sql_type: TEXT
+        nullable: true
+        non_blank_when_present: true
+        conditional: extraction_state
+        note: Software parser version, not legal history. Do not invent it for legacy rows.
+    extraction_states:
+      not_attempted:
+        null_fields: [text, text_sha256, text_chars, status_reason, text_fetched_at, extractor_version]
+        node_count: 0
+      ok:
+        required_fields: [text, text_sha256, text_chars, text_fetched_at, extractor_version]
+        non_blank_fields: [text, extractor_version]
+        minimum_text_chars: 1
+        minimum_node_count: 1
+        status_reason_optional: true
+      empty_response: &failed_state
+        required_fields: [text, text_chars, status_reason, text_fetched_at, extractor_version]
+        non_blank_fields: [status_reason, extractor_version]
+        exact_values: {text: "", text_chars: 0, text_sha256: null}
+        node_count: 0
+      no_usable_text: *failed_state
+      needs_review: *failed_state
+      http_error: *failed_state
+    row_rules:
+      - id: instrument_source_url_matches_id
+        severity: error
+        enforced_by: [python]
+        rule: The Digesto URL path is /consultas/normas/shownorms.php and its single decoded idnorm query value equals source_id.
+      - id: instrument_content_hash
+        severity: error
+        enforced_by: [python]
+        when: extraction_status == ok
+        rule: text_sha256 equals hashlib.sha256(text.encode('utf-8')).hexdigest(). SQL checks only the hash shape.
+      - id: instrument_content_length
+        severity: error
+        enforced_by: [python, sql]
+        when: extraction_status == ok
+        rule: text_chars equals len(text), measured in Unicode code points, not bytes.
+      - id: instrument_state_payload
+        severity: error
+        enforced_by: [python, sql]
+        rule: Every field satisfies its extraction_states definition, including conditional nullability.
+      - id: instrument_identity_unique
+        severity: error
+        enforced_by: [python, sql]
+        rule: The business_key is non-null and unique; reject rather than silently deduplicate.
+
+  document_nodes:
+    grain: One structural node within one current instrument.
+    business_key: [source_id, node_key]
+    database_business_key: [legal_instrument_id, node_key]
+    database_generated:
+      id: {sql_type: BIGINT, generation: identity, primary_key: true}
+    database_columns:
+      legal_instrument_id:
+        sql_type: BIGINT
+        nullable: false
+        references: legal_instruments.id
+        supplied_by: loader_source_id_lookup
+    columns:
+      source_id:
+        type: string
+        nullable: false
+        non_blank: true
+        persisted: false
+        references: legal_instruments.source_id
+        note: Resolve with source=digesto to legal_instrument_id; this string is not a generated database ID.
+      node_key:
+        type: string
+        sql_type: TEXT
+        nullable: false
+        non_blank: true
+        source_field: document_nodes[].id
+        note: Local to the current extraction, not a global or permanent article identity.
+      parent_node_key: {type: string, sql_type: TEXT, nullable: true, non_blank_when_present: true, source_field: "document_nodes[].parent_id"}
+      position: {type: integer, sql_type: INTEGER, nullable: false, minimum: 0, maximum: 2147483647}
+      node_type:
+        type: string
+        sql_type: TEXT
+        nullable: false
+        source_field: document_nodes[].type
+        allowed_values: [article, paragraph, heading, annex, list_item, table, preface, preamble, conclusion]
+        note: Source structure is not proof that a block is a numbered legal article.
+      label:
+        type: string
+        sql_type: TEXT
+        nullable: true
+        non_blank_when_present: true
+        note: Preserve the current parser label. Unknown normalization is allowed; labels need not be unique.
+      source_label:
+        type: string
+        sql_type: TEXT
+        nullable: true
+        allow_empty_string: true
+        note: Preserve original wording, spelling, punctuation and absence. Never invent sequential labels.
+      text: {type: string, sql_type: TEXT, nullable: false, non_blank: true}
+      start_char: {type: integer, sql_type: INTEGER, nullable: false, minimum: 0, maximum: 2147483647}
+      end_char: {type: integer, sql_type: INTEGER, nullable: false, minimum: 1, maximum: 2147483647}
+      source_locator: {type: string, sql_type: TEXT, nullable: false, non_blank: true}
+      links:
+        type: array
+        sql_type: JSONB
+        nullable: false
+        default: []
+        items:
+          type: object
+          required_keys: [text, href, url, source_locator]
+          string_fields: [text, href, url, source_locator]
+          non_blank_fields: [href, url, source_locator]
+          url_allowed_schemes: [https, http]
+          url_requires_hostname: true
+        note: A hyperlink does not establish amendment or repeal.
+      attributes:
+        type: object
+        sql_type: JSONB
+        nullable: false
+        default: {}
+        allow_extra_keys: true
+        note: Preserve unmapped fields such as rows, cells and source_internal_id.
+    row_rules:
+      - id: node_span_length
+        severity: error
+        enforced_by: [python, sql]
+        rule: start_char >= 0, end_char > start_char, and len(text) == end_char - start_char.
+      - id: node_identity_and_order_unique
+        severity: error
+        enforced_by: [python, sql]
+        rule: Both (source_id, node_key) and (source_id, position) are unique; use legal_instrument_id in SQL.
+      - id: node_not_own_parent
+        severity: error
+        enforced_by: [python, sql]
+        rule: parent_node_key is null or differs from node_key.
+      - id: node_json_shape
+        severity: error
+        enforced_by: [python, sql]
+        rule: links is an array and attributes is an object. Python also checks nested content and JSON serializability.
+      - id: node_table_attributes
+        severity: error
+        enforced_by: [python]
+        when: node_type == table
+        rule: attributes.rows is a nonempty list of lists of strings. Preserve cells/span metadata when provided; rows may differ in length.
+
+cross_table_rules:
+  - id: node_instrument_exists
+    severity: error
+    enforced_by: [python, sql]
+    rule: Every node resolves to one instrument; the loader maps (digesto, source_id) to its generated ID.
+  - id: nodes_only_for_accepted_content
+    severity: error
+    enforced_by: [python]
+    rule: Only ok instruments have nodes, and every ok instrument has at least one node.
+  - id: node_matches_instrument_slice
+    severity: error
+    enforced_by: [python]
+    rule: end_char <= len(instrument.text) and node.text == instrument.text[start_char:end_char], with zero-based exclusive-end offsets.
+  - id: parent_in_same_instrument
+    severity: error
+    enforced_by: [python, sql]
+    rule: Each non-null parent_node_key resolves within the same instrument, never another document with the same local key.
+  - id: tree_order_and_containment
+    severity: error
+    enforced_by: [python]
+    rule: Parent position is less than child position and its span contains the child's span. This ordering prevents cycles.
+  - id: node_positions_contiguous
+    severity: error
+    enforced_by: [python]
+    rule: Positions for each instrument are exactly 0 through node_count - 1.
+
+warnings:
+  - id: missing_optional_metadata
+    rule: Report missing dates, category, rank or number as completeness metrics; do not invent replacements.
+  - id: unexpected_date_order
+    rule: Flag approval after publication for review; do not reject or swap source dates solely on this comparison.
+  - id: unrecognized_node_label
+    rule: A null label with nonempty source_label is allowed but needs review; retain typos and written ordinals.
+  - id: source_structure_is_not_legal_meaning
+    rule: Unnumbered article containers may be prose; do not manufacture article numbers or claim verified legal interpretation.
+  - id: overlapping_node_text
+    rule: Parent nodes include descendants. Do not require the sum of node text lengths to equal document length.
+
+loading:
+  schema_mode: fresh_two_table_schema
+  existing_schema: Require an explicit migration for older installations; schema.sql never drops existing data.
+  unique_instrument_key: [source, source_id]
+  node_source_lookup: Resolve (digesto, source_id), add legal_instrument_id, then omit source_id from node INSERT columns.
+  generated_ids: Never use DataFrame indexes as database IDs or supply identity column values.
+  json_binding: Bind links and attributes as JSONB values, not Python repr strings.
+  column_binding: Use explicit INSERT column names; do not rely on DataFrame column order or dictionary order.
+  transaction: Update an instrument and replace its node tree together; resolve deferred parent constraints before commit.
+  repeated_load: Same input must not produce additional instruments or duplicate nodes.
+  failed_refresh: Preserve the entire existing ok content group and nodes, including status, reason, text, hash, count, parser version and text timestamp.
+  metadata_only_update: Update metadata independently while retaining accepted text unless an accepted replacement is supplied.
+  stale_batch: Do not replace newer metadata/text observations with older ones; compare their respective fetched timestamps independently.
+  equal_timestamp_conflict: Different accepted text hashes at the same text_fetched_at require review rather than an arbitrary overwrite.
+  omitted_records: Missing rows are not deletion instructions.
+
+validation_execution:
+  order: [schema_and_types, row_rules, cross_table_rules, warnings, parameter_normalization, load]
+  on_error: Block the affected instrument and all its nodes. V1 may fail the entire batch; never partially load a tree.
+  on_warning: Report while keeping source values; warnings alone do not block loading.
+  issue_fields: [rule_id, severity, table, source_id, node_key, message]
+  implementation_note: transform._measure_quality_dimensions reports table checks using pipelines.quality; extract_data writes one combined quality_report.json. The report does not modify data or block loading; the loader must enforce on_error separately.
+  sql_limit: CHECK constraints do not enforce source decoding, actual hashes, cross-table text slices, tree ordering or refresh policy.
+
+acceptance_examples:
+  - {case: Valid source date, source_value: "04/06/2015", expected_iso_date: "2015-06-04"}
+  - {case: Missing source date, source_value: "", expected_value: null}
+  - {case: Invalid source date, source_value: "31/02/2015", expected: error}
+  - {case: Metadata without text, expected_status: not_attempted, expected_nodes: 0}
+  - {case: ok text without a hash or parser version, expected: error}
+  - {case: Same node_key in different instruments, expected: valid}
+  - {case: Duplicate node_key or position within one instrument, expected: error}
+  - {case: Parent only exists in another instrument, expected: error}
+  - {case: Node differs from its instrument text slice, expected: error}
+  - {case: Unknown normalized label with source_label retained, expected: warning}
