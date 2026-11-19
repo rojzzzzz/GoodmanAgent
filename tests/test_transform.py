@@ -191,7 +191,7 @@ class BuildTablesTests(unittest.TestCase):
         self.assertEqual(metadata_only["legal_instruments"]["extraction_status"].tolist(), ["not_attempted"] * 2)
 
     def test_extract_data_reads_given_directory_and_returns_both_tables(self):
-        from pipelines.initial.config import METADATA_PATH, TEXT_PATH
+        from config import METADATA_PATH, TEXT_PATH
         with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as temporary:
             folder = Path(temporary)
             metadata = {"iunpid": "MQ==", "categoria": "Ley", "numero": "1", "rango": "Ley",
@@ -211,7 +211,7 @@ class BuildTablesTests(unittest.TestCase):
         self.assertEqual(len(tables["document_nodes"]), 1)
 
     def test_extract_data_supports_an_empty_text_snapshot(self):
-        from pipelines.initial.config import METADATA_PATH, TEXT_PATH
+        from config import METADATA_PATH, TEXT_PATH
         with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as temporary:
             folder = Path(temporary)
             metadata = {"iunpid": "MQ==", "categoria": "Ley", "numero": "1", "rango": "Ley",

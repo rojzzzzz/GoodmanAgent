@@ -161,6 +161,11 @@ tables:
         nullable: false
         references: legal_instruments.id
         supplied_by: loader_source_id_lookup
+      embedding:
+        sql_type: VECTOR(1536)
+        nullable: true
+        supplied_by: article_embedding_stage
+        note: Added after quality checks; null for non-articles and oversized inputs.
     columns:
       source_id:
         type: string

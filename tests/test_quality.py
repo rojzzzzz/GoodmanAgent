@@ -12,7 +12,7 @@ from unittest.mock import patch
 import pandas as pd
 
 from pipelines.initial import transform
-from pipelines.initial.config import METADATA_PATH, TEXT_PATH, QUALITY_REPORT_FILENAME
+from config import METADATA_PATH, TEXT_PATH, QUALITY_REPORT_FILENAME
 
 
 class QualityReportTests(unittest.TestCase):

@@ -44,7 +44,7 @@ class DataContractTests(unittest.TestCase):
 
     def test_sql_creates_only_the_declared_tables_and_resolves_node_source_ids(self):
         schema = (ROOT / "database/schema.sql").read_text(encoding="utf-8")
-        self.assertEqual(set(re.findall(r"CREATE TABLE\s+(\w+)", schema)), set(self.contract["tables"]))
+        self.assertEqual(set(re.findall(r"CREATE TABLE(?: IF NOT EXISTS)?\s+(\w+)", schema)), set(self.contract["tables"]))
         self.assertNotRegex(schema, r"\bDROP\s+TABLE\b")
         node = self.contract["tables"]["document_nodes"]
         self.assertIs(node["columns"]["source_id"]["persisted"], False)

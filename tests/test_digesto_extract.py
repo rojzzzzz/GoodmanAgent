@@ -1,19 +1,23 @@
 """Offline regression cases for the V1 main-text extractor."""
 
 import argparse
+import asyncio
 import base64
+from functools import partial
 import hashlib
 import json
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
+from urllib.parse import parse_qs
 
-import requests
+import httpx
 
-import pipelines.initial.config
+import config
 import pipelines.initial.extract as extractor
 
 
@@ -26,12 +30,7 @@ LEGAL_HTML = """<html><body><h1>DECRETO DE PRUEBA</h1>
 
 
 def response(body=LEGAL_HTML, status=200):
-    result = requests.Response()
-    result.status_code = status
-    result._content = body
-    result.headers["Content-Type"] = "text/html; charset=utf-8"
-    result.url = extractor.API
-    return result
+    return httpx.Response(status, content=body, headers={"Content-Type": "text/html; charset=utf-8"})
 
 
 def instrument(number=1):
@@ -223,12 +222,12 @@ class ExtractorTests(unittest.TestCase):
                 "total_reported": 2, "items": items})
         args = argparse.Namespace(cache_dir=self.root, refresh=True, max_pages=None,
                                   output=self.root / "catalog.jsonl", delay=1.0, retries=0)
-        with patch.object(extractor, "DigestoClient") as client:
-            client.return_value.list_page.side_effect = [([instrument(3)], 2), requests.Timeout()]
-            with self.assertRaises(requests.Timeout):
+        with patch.object(extractor, "DigestoClient", autospec=True) as client:
+            client.return_value.list_page.side_effect = [([instrument(3)], 2), httpx.ReadTimeout("timed out")]
+            with self.assertRaises(httpx.ReadTimeout):
                 extractor.catalog(args)
         args.refresh = False
-        with patch.object(extractor, "DigestoClient") as client:
+        with patch.object(extractor, "DigestoClient", autospec=True) as client:
             extractor.catalog(args)
             client.assert_not_called()
         self.assertEqual([row["iunpid"] for row in extractor.jsonl_rows(args.output)], ["MQ==", "Mg=="])
@@ -236,11 +235,11 @@ class ExtractorTests(unittest.TestCase):
     def test_successful_refresh_promotes_one_complete_cache(self):
         args = argparse.Namespace(cache_dir=self.root, refresh=True, max_pages=None,
                                   output=self.root / "catalog.jsonl", delay=1.0, retries=0)
-        with patch.object(extractor, "DigestoClient") as client:
+        with patch.object(extractor, "DigestoClient", autospec=True) as client:
             client.return_value.list_page.side_effect = [([instrument(3)], 1), ([], 1)]
             extractor.catalog(args)
         args.refresh = False
-        with patch.object(extractor, "DigestoClient") as client:
+        with patch.object(extractor, "DigestoClient", autospec=True) as client:
             extractor.catalog(args)
             client.assert_not_called()
         self.assertEqual([row["iunpid"] for row in extractor.jsonl_rows(args.output)], ["Mw=="])
@@ -250,7 +249,7 @@ class ExtractorTests(unittest.TestCase):
         self.write_rows(args.metadata, [instrument(1), instrument(2), instrument(3)])
         self.write_rows(args.output, [{"iunpid": "MQ==", "status": "empty_response", "text": ""},
                                      {"iunpid": "Mg==", "status": "ok", "text": "Existing good text"}])
-        with patch.object(extractor, "DigestoClient") as client:
+        with patch.object(extractor, "DigestoClient", autospec=True) as client:
             client.return_value.main_text.return_value = response()
             extractor.texts(args)
             self.assertEqual(client.return_value.main_text.call_args_list[0].args, ("MQ==",))
@@ -264,11 +263,11 @@ class ExtractorTests(unittest.TestCase):
         args.retry_failed = False
         args.refresh = True
         args.ids = ["1"]
-        with patch.object(extractor, "DigestoClient") as client:
+        with patch.object(extractor, "DigestoClient", autospec=True) as client:
             client.return_value.main_text.return_value = response(b"")
             extractor.texts(args)
         self.assertEqual(list(extractor.jsonl_rows(args.output)), rows)
-        with patch.object(extractor, "DigestoClient") as client:
+        with patch.object(extractor, "DigestoClient", autospec=True) as client:
             client.return_value.main_text.return_value = response(LEGAL_HTML.replace(b"5</td>", b"8</td>"))
             extractor.texts(args)
         refreshed = list(extractor.jsonl_rows(args.output))
@@ -282,14 +281,14 @@ class ExtractorTests(unittest.TestCase):
         previous = {"iunpid": "MQ==", "status": "empty_response", "text": ""}
         self.write_rows(args.output, [previous])
         original = args.output.read_bytes()
-        with patch.object(extractor, "DigestoClient") as client:
+        with patch.object(extractor, "DigestoClient", autospec=True) as client:
             client.return_value.main_text.return_value = response()
             with patch.object(extractor, "atomic_jsonl", side_effect=OSError("disk full")):
                 with self.assertRaises(OSError):
                     extractor.texts(args)
         self.assertEqual(args.output.read_bytes(), original)
         args.retry_failed = False
-        with patch.object(extractor, "DigestoClient") as client:
+        with patch.object(extractor, "DigestoClient", autospec=True) as client:
             extractor.texts(args)
             client.assert_not_called()
         self.assertEqual(list(extractor.jsonl_rows(args.output))[0]["status"], "ok")
@@ -297,22 +296,70 @@ class ExtractorTests(unittest.TestCase):
     def test_document_http_failure_does_not_discard_later_success(self):
         args = self.text_args()
         self.write_rows(args.metadata, [instrument(1), instrument(2)])
-        with patch.object(extractor, "DigestoClient") as client:
-            client.return_value.main_text.side_effect = [requests.Timeout("timed out"), response()]
+        with patch.object(extractor, "DigestoClient", autospec=True) as client:
+            client.return_value.main_text.side_effect = [httpx.ReadTimeout("timed out"), response()]
             extractor.texts(args)
         rows = list(extractor.jsonl_rows(args.output))
         self.assertEqual([row["status"] for row in rows], ["http_error", "ok"])
 
+    def test_text_requests_overlap_without_exceeding_the_start_rate(self):
+        args = self.text_args(delay=0.25)
+        self.write_rows(args.metadata, [instrument(1), instrument(2), instrument(3)])
+        second_started = asyncio.Event()
+        starts = []
+        active = 0
+        peak = 0
+
+        async def serve(request):
+            nonlocal active, peak
+            starts.append(time.monotonic())
+            if request.method == "GET":
+                return httpx.Response(200)
+            identifier = parse_qs(request.content.decode())["iunp"][0]
+            active += 1
+            peak = max(peak, active)
+            if identifier == "MQ==":
+                await asyncio.wait_for(second_started.wait(), timeout=5)
+            else:
+                second_started.set()
+            active -= 1
+            return httpx.Response(200, content=LEGAL_HTML)
+
+        with patch.object(extractor.httpx, "AsyncClient",
+                          side_effect=partial(httpx.AsyncClient, transport=httpx.MockTransport(serve))) as client:
+            result = extractor.run_extraction(
+                stage="texts", metadata_path=args.metadata, text_path=args.output,
+                raw_dir=args.raw_dir, limit=None, delay=args.delay, retries=args.retries,
+            )
+        self.assertEqual(result.fetched, 3)
+        self.assertEqual(peak, 2)
+        self.assertEqual(len(starts), 4)
+        for previous, following in zip(starts, starts[1:]):
+            self.assertGreaterEqual(following - previous, args.delay - 0.01)
+        self.assertEqual([row["numeric_id"] for row in extractor.jsonl_rows(args.output)], ["1", "2", "3"])
+        client.assert_called_once()
+
     def test_completed_records_survive_later_access_block(self):
         args = self.text_args()
-        self.write_rows(args.metadata, [instrument(1), instrument(2)])
-        with patch.object(extractor, "DigestoClient") as client:
-            client.return_value.main_text.side_effect = [response(), RuntimeError("access blocked")]
-            with self.assertRaises(RuntimeError):
+        self.write_rows(args.metadata, [instrument(1), instrument(2), instrument(3), instrument(4)])
+        sent = []
+
+        def serve(request):
+            if request.method == "GET":
+                return httpx.Response(200)
+            identifier = parse_qs(request.content.decode())["iunp"][0]
+            sent.append(identifier)
+            return response() if identifier == "MQ==" else response(status=429)
+
+        with patch.object(extractor.httpx, "AsyncClient",
+                          side_effect=partial(httpx.AsyncClient, transport=httpx.MockTransport(serve))):
+            with self.assertRaisesRegex(RuntimeError, "HTTP 429"):
                 extractor.texts(args)
+        self.assertEqual(sent, ["MQ==", "Mg=="])
         rows = list(extractor.jsonl_rows(args.output))
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "ok")
+        self.assertFalse(args.output.with_name(args.output.name + ".lock").exists())
 
     def test_pending_current_record_is_recovered_without_refetch(self):
         args = self.text_args()
@@ -320,23 +367,39 @@ class ExtractorTests(unittest.TestCase):
         pending = args.output.with_name(args.output.name + ".pending")
         pending.mkdir()
         extractor.atomic_json(pending / "1.json", {"iunpid": "MQ==", "status": "ok", "text": "Recovered"})
-        with patch.object(extractor, "DigestoClient") as client:
+        with patch.object(extractor, "DigestoClient", autospec=True) as client:
             extractor.texts(args)
             client.assert_not_called()
         self.assertEqual(list(extractor.jsonl_rows(args.output))[0]["text"], "Recovered")
 
     def test_transient_http_retry_respects_blocked_statuses(self):
-        for statuses, expected_calls in (((503, 200), 2), ((403,), 1), ((429,), 1)):
-            with self.subTest(statuses=statuses):
-                client = extractor.DigestoClient(1.0, retries=1)
-                with patch.object(client.session, "request", side_effect=[response(status=s) for s in statuses]) as call:
-                    with patch("time.sleep"):
-                        if statuses[0] in (403, 429):
-                            with self.assertRaises(RuntimeError):
-                                client.main_text("MQ==")
-                        else:
-                            self.assertEqual(client.main_text("MQ==").status_code, 200)
-                self.assertEqual(call.call_count, expected_calls)
+        for responses in ((response(status=503), response()), (response(status=403),),
+                          (response(status=429),), (httpx.Response(503, headers={"Retry-After": "60"}),),
+                          (response(b"<title>Just a moment</title>"),)):
+            with self.subTest(responses=responses):
+                remaining = iter(responses)
+                starts = []
+
+                def serve(_):
+                    starts.append(time.monotonic())
+                    return next(remaining)
+
+                async def fetch():
+                    client = extractor.DigestoClient(1.0, retries=1)
+                    try:
+                        return await client.main_text("MQ==")
+                    finally:
+                        await client.aclose()
+
+                with patch.object(extractor.httpx, "AsyncClient",
+                                  side_effect=partial(httpx.AsyncClient, transport=httpx.MockTransport(serve))):
+                    if len(responses) == 1:
+                        with self.assertRaises(RuntimeError):
+                            asyncio.run(fetch())
+                    else:
+                        self.assertEqual(asyncio.run(fetch()).status_code, 200)
+                        self.assertGreaterEqual(starts[1] - starts[0], 0.99)
+                self.assertEqual(len(starts), len(responses))
 
     def test_invalid_ids_do_not_pass_validation(self):
         self.assertFalse(extractor.is_real_record({"iunpid": "not-base64"}))
@@ -348,7 +411,7 @@ class ExtractorTests(unittest.TestCase):
 
     def test_callable_runs_full_pipeline_using_configured_paths_and_returns_results(self):
         paths = self.configured_paths()
-        with patch.multiple(pipelines.initial.config, **paths), patch.object(extractor, "DigestoClient") as client:
+        with patch.multiple(config, **paths), patch.object(extractor, "DigestoClient", autospec=True) as client:
             client.return_value.list_page.side_effect = [([instrument()], 1), ([], 1)]
             client.return_value.main_text.return_value = response()
             result = extractor.run_extraction(limit=None)
@@ -364,7 +427,7 @@ class ExtractorTests(unittest.TestCase):
     def test_callable_text_stage_supports_path_overrides_numeric_ids_and_resume(self):
         paths = self.configured_paths()
         self.write_rows(paths["METADATA_PATH"], [instrument(1), instrument(2)])
-        with patch.object(extractor, "DigestoClient") as client:
+        with patch.object(extractor, "DigestoClient", autospec=True) as client:
             client.return_value.main_text.return_value = response()
             result = extractor.run_extraction(stage="texts", metadata_path=paths["METADATA_PATH"],
                                              text_path=paths["TEXT_PATH"], raw_dir=paths["RAW_RESPONSE_DIR"],
@@ -373,7 +436,7 @@ class ExtractorTests(unittest.TestCase):
         self.assertIsNone(result.catalog_complete)
         self.assertIsNone(result.manifest_path)
         self.assertEqual(result.accepted, 1)
-        with patch.object(extractor, "DigestoClient") as client:
+        with patch.object(extractor, "DigestoClient", autospec=True) as client:
             again = extractor.run_extraction(stage="texts", metadata_path=paths["METADATA_PATH"],
                                             text_path=paths["TEXT_PATH"], raw_dir=paths["RAW_RESPONSE_DIR"], ids=[2])
             client.assert_not_called()
@@ -384,7 +447,7 @@ class ExtractorTests(unittest.TestCase):
         paths = self.configured_paths()
         self.write_rows(paths["METADATA_PATH"], [instrument(2)])
         original = paths["METADATA_PATH"].read_bytes()
-        with patch.multiple(pipelines.initial.config, **paths), patch.object(extractor, "DigestoClient") as client:
+        with patch.multiple(config, **paths), patch.object(extractor, "DigestoClient", autospec=True) as client:
             client.return_value.list_page.return_value = ([instrument(1)], 2)
             client.return_value.main_text.return_value = response()
             result = extractor.run_extraction(max_pages=1)
@@ -394,13 +457,23 @@ class ExtractorTests(unittest.TestCase):
         self.assertEqual(paths["METADATA_PATH"].read_bytes(), original)
         self.assertEqual([row["iunpid"] for row in extractor.jsonl_rows(result.text_path)], ["MQ=="])
 
+    def test_selected_ids_support_unlimited_text_fetching(self):
+        paths = self.configured_paths()
+        self.write_rows(paths["METADATA_PATH"], [instrument(1)])
+        with patch.multiple(config, **paths), patch.object(extractor, "DigestoClient", autospec=True) as client:
+            client.return_value.main_text.return_value = response()
+            with self.assertLogs(extractor.LOG, level="WARNING") as logs:
+                result = extractor.run_extraction(stage="texts", ids=[1, 2], limit=None)
+        self.assertEqual(result.accepted, 1)
+        self.assertIn("Requested IDs not found", logs.output[0])
+
     def test_callable_invalid_options_and_colliding_paths_fail_before_writes(self):
-        cases = [{"delay": 0}, {"retries": 6}, {"limit": 0}, {"ids": "3041"},
+        cases = [{"delay": 0}, {"delay": 0.24}, {"retries": 6}, {"limit": 0}, {"ids": "3041"},
                  {"ids": [0]}, {"refresh_texts": True, "retry_failed": True},
                  {"stage": "unknown"}, {"stage": "texts", "max_pages": 1},
                  {"stage": "catalog", "ids": [1]}]
         for kwargs in cases:
-            with self.subTest(kwargs=kwargs), patch.object(extractor, "DigestoClient") as client:
+            with self.subTest(kwargs=kwargs), patch.object(extractor, "DigestoClient", autospec=True) as client:
                 with self.assertRaises(ValueError):
                     extractor.run_extraction(**kwargs)
                 client.assert_not_called()
@@ -422,16 +495,16 @@ class ExtractorTests(unittest.TestCase):
 
     def test_callable_missing_metadata_raises_instead_of_exiting(self):
         paths = self.configured_paths()
-        with patch.multiple(pipelines.initial.config, **paths), patch.object(extractor, "DigestoClient") as client:
+        with patch.multiple(config, **paths), patch.object(extractor, "DigestoClient", autospec=True) as client:
             with self.assertRaises(FileNotFoundError):
                 extractor.run_extraction(stage="texts")
             client.assert_not_called()
 
     def test_cli_uses_config_defaults_and_the_callable_entrypoint(self):
         paths = self.configured_paths()
-        with patch.multiple(pipelines.initial.config, **paths), patch.object(extractor, "run_extraction") as run:
+        with patch.multiple(config, **paths), patch.object(extractor, "run_extraction") as run:
             with patch.object(extractor.logging, "basicConfig"):
-                result = extractor.main(["texts", "--all", "--refresh", "--ids", "3041"])
+                result = extractor.main(["texts", "--all", "--refresh", "--ids", "3041", "--delay", "0.25"])
             self.assertIs(result, run.return_value)
             self.assertEqual(run.call_args.kwargs["metadata_path"], paths["METADATA_PATH"])
             self.assertEqual(run.call_args.kwargs["text_path"], paths["TEXT_PATH"])
@@ -439,13 +512,24 @@ class ExtractorTests(unittest.TestCase):
             self.assertIsNone(run.call_args.kwargs["limit"])
             self.assertTrue(run.call_args.kwargs["refresh_texts"])
             self.assertEqual(run.call_args.kwargs["ids"], ["3041"])
+            self.assertEqual(run.call_args.kwargs["delay"], 0.25)
 
     def test_import_is_inert_and_defaults_do_not_depend_on_working_directory(self):
         project = Path(__file__).resolve().parents[1]
-        code = f"import sys; sys.path.insert(0, {str(project)!r}); import pipelines.initial.extract, pipelines.initial.config; print(pipelines.initial.config.METADATA_PATH)"
+        code = (
+            f"import sys; sys.path.insert(0, {str(project)!r}); "
+            "import config; from pipelines.initial import extract; "
+            "assert extract.config is config; "
+            "print(config.METADATA_PATH); print(config.CONTRACT_PATH); print(config.SQL_TABLES)"
+        )
         result = subprocess.run([sys.executable, "-c", code], cwd=self.root, text=True,
                                 capture_output=True, check=True)
-        self.assertEqual(Path(result.stdout.strip()), project / "pipelines" / "initial" / "output" / "digesto_metadata.jsonl")
+        initial_dir = project / "pipelines" / "initial"
+        self.assertEqual([Path(line) for line in result.stdout.splitlines()], [
+            initial_dir / "output" / "digesto_metadata.jsonl",
+            initial_dir / "data_contract.yaml",
+            project / "database" / "schema.sql",
+        ])
         self.assertFalse(list(self.root.iterdir()))
 
 

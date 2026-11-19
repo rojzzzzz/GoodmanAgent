@@ -2,14 +2,16 @@
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from pipelines.initial import config, extract, main as pipeline, transform
+import config
 import test_digesto_extract
+from pipelines.initial import extract, main as pipeline, transform
 
 
 class InitialPipelineTests(unittest.TestCase):
@@ -27,6 +29,19 @@ class InitialPipelineTests(unittest.TestCase):
         patcher = patch.multiple(config, **self.paths)
         patcher.start()
         self.addCleanup(patcher.stop)
+        schema_patcher = patch.object(pipeline, "initialize_database")
+        self.initialize = schema_patcher.start()
+        self.addCleanup(schema_patcher.stop)
+        api_patcher = patch("openai.OpenAI")
+        self.api = api_patcher.start().return_value.__enter__.return_value.embeddings.create
+        self.api.side_effect = lambda **kwargs: SimpleNamespace(data=[
+            SimpleNamespace(index=index, embedding=[0.25] * kwargs["dimensions"])
+            for index in range(len(kwargs["input"]))
+        ])
+        self.addCleanup(api_patcher.stop)
+        tokenizer = patch("tiktoken.encoding_for_model")
+        tokenizer.start().return_value.encode.side_effect = lambda text, **kwargs: text.split()
+        self.addCleanup(tokenizer.stop)
         self.instrument = {
             **test_digesto_extract.instrument(), "categoria": "Ley", "rango": "Ley",
             "fechaAprobacion": "04/06/2015", "fechaPublicacion": "09/10/2015",
@@ -34,7 +49,7 @@ class InitialPipelineTests(unittest.TestCase):
 
     def client(self):
         """Provide a fake API client serving one complete catalog and legal document."""
-        patcher = patch.object(extract, "DigestoClient")
+        patcher = patch.object(extract, "DigestoClient", autospec=True)
         client = patcher.start()
         self.addCleanup(patcher.stop)
         client.return_value.list_page.side_effect = [([self.instrument], 1), ([], 1)]
@@ -46,8 +61,8 @@ class InitialPipelineTests(unittest.TestCase):
         with patch.object(pipeline, "run_extraction", wraps=extract.run_extraction) as run, \
                 patch.object(transform, "_measure_quality_dimensions", wraps=transform._measure_quality_dimensions) as measure, \
                 patch.object(pipeline, "upload_to_postgres", return_value={"legal_instruments": 1, "document_nodes": 8}) as upload:
-            result = pipeline.run_initial_pipeline(limit=1)
-        run.assert_called_once_with(stage="all", limit=1)
+            result = pipeline.run_initial_pipeline(limit=1, delay=0.25)
+        run.assert_called_once_with(stage="all", limit=1, delay=0.25)
         self.assertEqual(measure.call_count, 2)
         report_path = self.paths["OUTPUT_DIR"] / config.QUALITY_REPORT_FILENAME
         report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -56,6 +71,11 @@ class InitialPipelineTests(unittest.TestCase):
         instruments, nodes = upload.call_args.args
         self.assertEqual(len(instruments), 1)
         self.assertGreater(len(nodes), 0)
+        self.initialize.assert_called_once_with(require_empty=True)
+        self.api.assert_called_once()
+        articles = nodes["node_type"].eq("article")
+        self.assertTrue(nodes.loc[articles, "embedding"].map(len).eq(1536).all())
+        self.assertTrue(nodes.loc[~articles, "embedding"].isna().all())
         self.assertEqual(str(instruments.iloc[0]["fecha_aprobacion"]), "2015-06-04")
         self.assertEqual(result, upload.return_value)
 
@@ -66,6 +86,8 @@ class InitialPipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Quality checks did not pass"):
                 pipeline.run_initial_pipeline(limit=1)
         upload.assert_not_called()
+        self.initialize.assert_not_called()
+        self.api.assert_not_called()
         report = json.loads((self.paths["OUTPUT_DIR"] / config.QUALITY_REPORT_FILENAME).read_text(encoding="utf-8"))
         self.assertEqual(report["status"], "failed")
 
@@ -104,13 +126,15 @@ class InitialPipelineTests(unittest.TestCase):
     def test_cli_selects_full_or_limited_text_fetching(self):
         with patch.object(pipeline, "run_initial_pipeline") as run, patch.object(pipeline.logging, "basicConfig"):
             pipeline.main([])
-            run.assert_called_once_with(limit=None)
+            run.assert_called_once_with(limit=None, delay=None)
             run.reset_mock()
-            pipeline.main(["--limit", "25"])
-            run.assert_called_once_with(limit=25)
+            pipeline.main(["--limit", "25", "--delay", "0.25"])
+            run.assert_called_once_with(limit=25, delay=0.25)
             run.reset_mock()
             with self.assertRaises(SystemExit), patch("sys.stderr"):
                 pipeline.main(["--limit", "0"])
+            with self.assertRaises(SystemExit), patch("sys.stderr"):
+                pipeline.main(["--delay", "0.24"])
             run.assert_not_called()
 
     def test_import_does_not_start_extraction_or_database_calls(self):
@@ -125,3 +149,12 @@ class InitialPipelineTests(unittest.TestCase):
         )
         subprocess.run([sys.executable, "-c", code], cwd=self.root, capture_output=True, text=True, check=True)
         self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_embedding_failure_stops_before_loading(self):
+        self.client()
+        self.api.side_effect = RuntimeError("Embedding service unavailable")
+        with patch.object(pipeline, "upload_to_postgres") as upload:
+            with self.assertRaisesRegex(RuntimeError, "Embedding service unavailable"):
+                pipeline.run_initial_pipeline(limit=1)
+        upload.assert_not_called()
+        self.assertTrue(self.paths["TEXT_PATH"].is_file())

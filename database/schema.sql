@@ -1,6 +1,8 @@
 BEGIN;
 
-CREATE TABLE legal_instruments (
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE IF NOT EXISTS legal_instruments (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     source TEXT NOT NULL CHECK (source = 'digesto'),
     source_id TEXT NOT NULL CHECK (btrim(source_id) <> '' AND source_id = btrim(source_id)),
@@ -48,7 +50,7 @@ CREATE TABLE legal_instruments (
     )
 );
 
-CREATE TABLE document_nodes (
+CREATE TABLE IF NOT EXISTS document_nodes (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     -- Loader resolves the transformed source_id to this generated database ID.
     legal_instrument_id BIGINT NOT NULL
@@ -68,6 +70,9 @@ CREATE TABLE document_nodes (
     source_locator TEXT NOT NULL CHECK (btrim(source_locator) <> ''),
     links JSONB NOT NULL DEFAULT '[]'::JSONB CHECK (jsonb_typeof(links) = 'array'),
     attributes JSONB NOT NULL DEFAULT '{}'::JSONB CHECK (jsonb_typeof(attributes) = 'object'),
+
+    embedding VECTOR(1536),
+
     CONSTRAINT node_key_per_instrument UNIQUE (legal_instrument_id, node_key),
     CONSTRAINT node_position_per_instrument UNIQUE (legal_instrument_id, position),
     CONSTRAINT valid_node_span CHECK (
@@ -82,7 +87,10 @@ CREATE TABLE document_nodes (
         ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
 );
 
-CREATE INDEX document_nodes_parent_idx
+-- Upgrade databases created before article embeddings were introduced.
+ALTER TABLE document_nodes ADD COLUMN IF NOT EXISTS embedding VECTOR(1536);
+
+CREATE INDEX IF NOT EXISTS document_nodes_parent_idx
     ON document_nodes (legal_instrument_id, parent_node_key);
 
 COMMIT;

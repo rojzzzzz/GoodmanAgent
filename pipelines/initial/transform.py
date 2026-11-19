@@ -1,4 +1,4 @@
-from pipelines.initial.config import METADATA_PATH, TEXT_PATH, CONTRACT_PATH, QUALITY_REPORT_FILENAME
+from config import METADATA_PATH, TEXT_PATH, CONTRACT_PATH, QUALITY_REPORT_FILENAME
 from pipelines.initial.quality import measure_table, measure_cross_tables
 from pathlib import Path
 import pandas as pd

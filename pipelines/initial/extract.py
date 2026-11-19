@@ -6,9 +6,9 @@ Scope:
 * Two current-state JSONL files. No legal version or attempt history.
 * Resumable: catalog pages and current text checkpoints are cached.
 * Log empty/unusable documents instead of silently dropping them.
-* Do not evade HTTP restrictions or run faster than one request per second.
+* Space request starts across the session and stop on HTTP access restrictions.
 
-Dependencies: pip install requests beautifulsoup4
+Dependencies: pip install httpx beautifulsoup4
 
 Python API:
     from extract import run_extraction
@@ -23,11 +23,14 @@ Outputs:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import binascii
-from contextlib import contextmanager
+from contextlib import AsyncExitStack, contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
+from itertools import chain
 import json
 import logging
 import math
@@ -35,11 +38,11 @@ import os
 from pathlib import Path
 import sys
 import time
-from datetime import datetime, timezone
 from urllib.parse import quote
 
-import requests
-import pipelines.initial.config as config
+import httpx
+
+import config
 from pipelines.initial.digesto_document import EXTRACTOR_VERSION, extract_document
 
 BASE = "https://digesto.asamblea.gob.ni"
@@ -67,11 +70,17 @@ class ExtractionResult:
     preserved: int = 0
 
 
+def validate_request_delay(delay: float) -> None:
+    """Validate the minimum interval between request starts."""
+    minimum = config.MIN_REQUEST_DELAY_SECONDS
+    if not isinstance(delay, (int, float)) or not math.isfinite(delay) or delay < minimum:
+        raise ValueError(f"delay must be a finite value >= {minimum:g} seconds")
+
+
 def _validate_options(*, delay, retries, limit=None, max_pages=None, ids=None,
                       refresh_texts=False, retry_failed=False) -> None:
     """Reject invalid limits, request settings, IDs, or conflicting extraction modes."""
-    if not isinstance(delay, (int, float)) or not math.isfinite(delay) or delay < 1:
-        raise ValueError("delay must be a finite value >= 1.0 second")
+    validate_request_delay(delay)
     if type(retries) is not int or not 0 <= retries <= 5:
         raise ValueError("retries must be an integer between 0 and 5")
     if limit is not None and (type(limit) is not int or limit < 1):
@@ -131,16 +140,19 @@ def run_extraction(
     for directory in (cache, raw):
         if directory.exists() and not directory.is_dir():
             raise ValueError(f"Expected a cache/raw directory, got a file: {directory}")
-    manifest = None
+    catalog_args = text_args = None
     if stage in ("all", "catalog"):
-        manifest = catalog(argparse.Namespace(output=metadata, cache_dir=cache,
-                           max_pages=max_pages, refresh=refresh_catalog, delay=delay, retries=retries))
-        metadata = Path(manifest["output"])
-    counts = {}
+        catalog_args = argparse.Namespace(output=metadata, cache_dir=cache, max_pages=max_pages,
+                                          refresh=refresh_catalog, delay=delay, retries=retries)
     if stage in ("all", "texts"):
-        counts = texts(argparse.Namespace(metadata=metadata, output=output, raw_dir=raw,
-                       limit=limit, all=limit is None, ids=[str(identifier) for identifier in ids] if ids is not None else None,
-                       refresh=refresh_texts, retry_failed=retry_failed, delay=delay, retries=retries))
+        text_args = argparse.Namespace(metadata=metadata, output=output, raw_dir=raw,
+                                       limit=limit, all=limit is None,
+                                       ids=[str(identifier) for identifier in ids] if ids is not None else None,
+                                       refresh=refresh_texts, retry_failed=retry_failed,
+                                       delay=delay, retries=retries)
+    manifest, counts = asyncio.run(_run_stages(catalog_args, text_args))
+    if manifest is not None:
+        metadata = Path(manifest["output"])
     return ExtractionResult(
         metadata_path=metadata,
         text_path=output if stage != "catalog" and output.is_file() else None,
@@ -148,6 +160,36 @@ def run_extraction(
         catalog_complete=manifest["complete"] if manifest is not None else None,
         **counts,
     )
+
+
+async def _run_stages(catalog_args, text_args):
+    """Open one HTTP session on the first cache miss and share it across both stages."""
+    settings = catalog_args if catalog_args is not None else text_args
+    client = None
+    manifest = None
+    counts = {}
+    async with AsyncExitStack() as stack:
+        async def get_client():
+            nonlocal client
+            if client is None:
+                client = DigestoClient(settings.delay, retries=getattr(settings, "retries", 2))
+                stack.push_async_callback(client.aclose)
+                await client.initialize()
+            return client
+
+        if catalog_args is not None:
+            with output_lock(catalog_args.output), output_lock(catalog_args.cache_dir / "catalog"):
+                manifest = await _catalog(catalog_args, get_client)
+        if text_args is not None:
+            if manifest is not None:
+                text_args.metadata = Path(manifest["output"])
+            if not text_args.metadata.is_file():
+                raise FileNotFoundError(f"Missing metadata catalog: {text_args.metadata}. Run 'catalog' first.")
+            if text_args.metadata.resolve() == text_args.output.resolve():
+                raise ValueError("Metadata and text output must be different files")
+            with output_lock(text_args.output):
+                counts = await _texts(text_args, get_client)
+    return manifest, counts
 
 
 def utc_now() -> str:
@@ -257,62 +299,74 @@ class DigestoClient:
         """Create an HTTP session with request spacing and transient retry settings."""
         self.delay = delay
         self.retries = retries
-        self.last_request: float | None = None
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": "DigestoDataResearch/1.0",
-            "Accept": "application/json, text/html, */*",
-            "Accept-Language": "es-NI,es;q=0.9",
-        })
+        self._next_start = 0.0
+        self._start_lock = asyncio.Lock()
+        self._access_error: str | None = None
+        self.session = httpx.AsyncClient(
+            headers={
+                "User-Agent": "DigestoDataResearch/1.0",
+                "Accept": "application/json, text/html, */*",
+                "Accept-Language": "es-NI,es;q=0.9",
+            },
+            timeout=60,
+            follow_redirects=True,
+            event_hooks={"request": [self._throttle], "response": [self._check_status]},
+        )
 
-    def _throttle(self) -> None:
-        """Wait until the configured interval since the previous request has elapsed."""
-        if self.last_request is not None:
-            wait = self.delay - (time.monotonic() - self.last_request)
-            if wait > 0:
-                time.sleep(wait)
+    async def aclose(self) -> None:
+        await self.session.aclose()
 
-    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+    async def _throttle(self, request: httpx.Request) -> None:
+        """Space all request starts, including redirects and retries, across the session."""
+        async with self._start_lock:
+            wait = self._next_start - time.monotonic()
+            while wait > 0 and self._access_error is None:
+                await asyncio.sleep(wait)
+                wait = self._next_start - time.monotonic()
+            if self._access_error is not None:
+                raise RuntimeError(self._access_error)
+            self._next_start = time.monotonic() + self.delay
+
+    async def _check_status(self, response: httpx.Response) -> None:
+        status = response.status_code
+        if status in (403, 429) or (status == 503 and "Retry-After" in response.headers):
+            self._access_error = f"Digesto returned HTTP {status} and signaled an access restriction or backoff. Stopping."
+            raise RuntimeError(self._access_error)
+
+    async def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
         """Send a throttled request, retry transient failures, and stop on access restrictions."""
         for attempt in range(self.retries + 1):
-            self._throttle()
             try:
-                try:
-                    response = self.session.request(method, url, timeout=60, **kwargs)
-                finally:
-                    self.last_request = time.monotonic()
-            except (requests.ConnectionError, requests.Timeout):
+                response = await self.session.request(method, url, **kwargs)
+            except (httpx.NetworkError, httpx.TimeoutException, httpx.RemoteProtocolError, httpx.ProxyError):
                 if attempt >= self.retries:
                     raise
                 LOG.warning("Transient connection failure; retry %d/%d", attempt + 1, self.retries)
             else:
-                if response.status_code in (403, 429):
-                    raise RuntimeError(
-                        f"Digesto returned HTTP {response.status_code}. "
-                        "Stop this run and respect the server's access/rate restrictions.")
                 if is_access_challenge(response.content):
-                    raise RuntimeError("Digesto returned an access/security page. Stopping.")
+                    self._access_error = "Digesto returned an access/security page. Stopping."
+                    raise RuntimeError(self._access_error)
                 if response.status_code not in (500, 502, 503, 504) or attempt >= self.retries:
                     response.raise_for_status()
                     return response
                 LOG.warning("HTTP %d; retry %d/%d", response.status_code, attempt + 1, self.retries)
-            time.sleep(min(2 ** attempt, 30))
+            await asyncio.sleep(min(2 ** attempt, 30))
         raise RuntimeError("Request retries exhausted")
 
-    def initialize(self) -> None:
+    async def initialize(self) -> None:
         """Visit the search page to initialize the session before API requests."""
-        response = self._request("GET", SEARCH)
+        response = await self._request("GET", SEARCH)
         LOG.info("Session initialized (GET %s)", response.status_code)
 
-    def post(self, data: dict[str, str]) -> requests.Response:
+    async def post(self, data: dict[str, str]) -> httpx.Response:
         """Submit an API form with the site's expected AJAX headers."""
-        return self._request("POST", API, data=data, headers={
+        return await self._request("POST", API, data=data, headers={
             "X-Requested-With": "XMLHttpRequest",
             "Origin": BASE,
             "Referer": SEARCH,
         })
 
-    def list_page(self, page: int) -> tuple[list[dict], int | None]:
+    async def list_page(self, page: int) -> tuple[list[dict], int | None]:
         """Fetch one unfiltered catalog page and its reported total, when available."""
         form = {
             "hddQueryType": "getJuridicNorms",
@@ -325,7 +379,7 @@ class DigestoClient:
             "hddCurrentPage": str(page),
             "hddFieldSort": "",
         }
-        response = self.post(form)
+        response = await self.post(form)
         try:
             result = response.json()  # Content-Type may still say text/html.
             if isinstance(result, str):
@@ -344,9 +398,9 @@ class DigestoClient:
                     break
         return items, total
 
-    def main_text(self, iunpid: str) -> requests.Response:
+    async def main_text(self, iunpid: str) -> httpx.Response:
         """Fetch the main document response for an encoded instrument ID."""
-        return self.post({"hddQueryType": "getNormaHtmlAccordion", "iunp": iunpid})
+        return await self.post({"hddQueryType": "getNormaHtmlAccordion", "iunp": iunpid})
 
 
 def partial_path(path: Path) -> Path:
@@ -356,11 +410,11 @@ def partial_path(path: Path) -> Path:
 
 def catalog(args: argparse.Namespace) -> dict:
     """Collect catalog metadata while locking both its output and shared cache."""
-    with output_lock(args.output), output_lock(args.cache_dir / "catalog"):
-        return _catalog(args)
+    manifest, _ = asyncio.run(_run_stages(args, None))
+    return manifest
 
 
-def _catalog(args: argparse.Namespace) -> dict:
+async def _catalog(args: argparse.Namespace, get_client) -> dict:
     """Resume or refresh catalog pages, reconcile completeness, and return the manifest.
 
     Partial or unverified results are written separately so they cannot replace
@@ -379,7 +433,6 @@ def _catalog(args: argparse.Namespace) -> dict:
     if args.max_pages is not None and args.refresh:
         cache = args.cache_dir / "catalog_sample_pages"
     cache.mkdir(parents=True, exist_ok=True)
-    client: DigestoClient | None = None
     page = 1
     signatures: set[tuple[str, ...]] = set()
     rows: dict[str, dict] = {}
@@ -394,10 +447,8 @@ def _catalog(args: argparse.Namespace) -> dict:
             saved = json.loads(page_file.read_text(encoding="utf-8"))
             LOG.info("Page %d: using checkpoint", page)
         else:
-            if client is None:
-                client = DigestoClient(args.delay, retries=getattr(args, "retries", 2))
-                client.initialize()
-            items, total = client.list_page(page)
+            client = await get_client()
+            items, total = await client.list_page(page)
             saved = {"page": page, "fetched_at_utc": utc_now(), "total_reported": total, "items": items}
             atomic_json(page_file, saved)
             LOG.info("Page %d: downloaded %d response rows", page, len(items))
@@ -495,15 +546,42 @@ def save_raw_response(directory: Path, raw: bytes) -> tuple[str, str]:
 
 def texts(args: argparse.Namespace) -> dict[str, int]:
     """Check input paths and extract current text while holding the output lock."""
-    if not args.metadata.is_file():
-        raise FileNotFoundError(f"Missing metadata catalog: {args.metadata}. Run 'catalog' first.")
-    if args.metadata.resolve() == args.output.resolve():
-        raise ValueError("Metadata and text output must be different files")
-    with output_lock(args.output):
-        return _texts(args)
+    _, counts = asyncio.run(_run_stages(None, args))
+    return counts
 
 
-def _texts(args: argparse.Namespace) -> dict[str, int]:
+async def _fetch_text(client: DigestoClient, identifier: str, title: str, raw_dir: Path) -> dict:
+    url = source_url(identifier)
+    try:
+        response = await client.main_text(identifier)
+    except httpx.HTTPError as error:
+        response = error.response if isinstance(error, httpx.HTTPStatusError) else None
+        status, reason = "http_error", str(error)
+        text, nodes, encoding = "", [], None
+    else:
+        extracted = extract_document(response.content, content_type=response.headers.get("Content-Type", ""),
+                                     expected_title=title, document_url=url)
+        status, reason = extracted.status, extracted.reason
+        text, nodes, encoding = extracted.text, extracted.nodes, extracted.encoding
+
+    raw = response.content if response is not None else b""
+    result = {"iunpid": identifier, "numeric_id": decode_iunpid(identifier),
+              "source_url": url, "fetched_at_utc": utc_now(),
+              "status": status, "status_reason": reason,
+              "main_response_bytes": len(raw), "text_chars": len(text),
+              "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest() if text else None,
+              "text": text, "document_nodes": nodes, "encoding": encoding,
+              "extractor_version": EXTRACTOR_VERSION,
+              "http_status": response.status_code if response is not None else None,
+              "request": {"url": API, "method": "POST", "operation": "getNormaHtmlAccordion", "iunp": identifier}}
+    if response is not None:
+        raw_file, raw_digest = save_raw_response(raw_dir, raw)
+        result.update(raw_html_file=raw_file, raw_sha256=raw_digest,
+                      content_type=response.headers.get("Content-Type", ""))
+    return result
+
+
+async def _texts(args: argparse.Namespace, get_client) -> dict[str, int]:
     """Resume selected text extractions and return counts for this invocation.
 
     Recover pending records, save raw responses, and publish one current row
@@ -529,7 +607,8 @@ def _texts(args: argparse.Namespace) -> dict[str, int]:
     raw_dir = args.raw_dir if args.raw_dir is not None else Path(config.RAW_RESPONSE_DIR)
     seen_catalog = set()
     count = successes = rejected = preserved = 0
-    client: DigestoClient | None = None
+    work: dict[str, str] = {}
+    existing_order = tuple(current)
     try:
         for record in jsonl_rows(args.metadata):
             if not is_real_record(record):
@@ -549,66 +628,53 @@ def _texts(args: argparse.Namespace) -> dict[str, int]:
                 eligible = prior is None
             if not eligible:
                 continue
-            if not args.all and count >= args.limit:
+            if not args.all and len(work) >= args.limit:
                 break
-            if client is None:
-                client = DigestoClient(args.delay, retries=getattr(args, "retries", 2))
-                client.initialize()
-            response = None
-            raw = b""
+            work[identifier] = str(record.get("titulo") or "")
+
+        if work:
+            client = await get_client()
+            remaining = iter(work.items())
+
+            async def worker():
+                nonlocal count, successes, rejected, preserved
+                for identifier, title in remaining:
+                    result = await _fetch_text(client, identifier, title, raw_dir)
+                    status = result["status"]
+                    count += 1
+                    successes += status == "ok"
+                    rejected += status != "ok"
+                    if status != "ok" and current.get(identifier, {}).get("status") == "ok":
+                        preserved += 1
+                        LOG.warning("%s | refresh %s: %s. Keeping previous usable text. Raw response: %s",
+                                    result["numeric_id"], status, result["status_reason"],
+                                    result.get("raw_html_file"))
+                        continue
+                    path = pending / f"{result['numeric_id']}.json"
+                    atomic_json(path, result)
+                    pending_files.append(path)
+                    current[identifier] = result
+                    LOG.info("%d/%d | %s | %s | %d chars | %s", count, len(work), result["numeric_id"],
+                             status, result["text_chars"], title[:65])
+
+            workers = [asyncio.create_task(worker()) for _ in range(min(len(work), config.TEXT_REQUEST_CONCURRENCY))]
             try:
-                response = client.main_text(identifier)
-                raw = response.content
-                extracted = extract_document(raw, content_type=response.headers.get("Content-Type", ""),
-                                             expected_title=str(record.get("titulo") or ""),
-                                             document_url=source_url(identifier))
-                status, reason = extracted.status, extracted.reason
-                text, nodes, encoding = extracted.text, extracted.nodes, extracted.encoding
-            except requests.RequestException as error:
-                response = error.response
-                raw = response.content if response is not None else b""
-                status, reason = "http_error", str(error)
-                text, nodes, encoding = "", [], None
-            raw_file = raw_digest = None
-            if response is not None:
-                raw_file, raw_digest = save_raw_response(raw_dir, raw)
-            result = {"iunpid": identifier, "numeric_id": decode_iunpid(identifier),
-                      "source_url": source_url(identifier), "fetched_at_utc": utc_now(),
-                      "status": status, "status_reason": reason,
-                      "main_response_bytes": len(raw), "text_chars": len(text),
-                      "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest() if text else None,
-                      "text": text, "document_nodes": nodes, "encoding": encoding,
-                      "extractor_version": EXTRACTOR_VERSION,
-                      "http_status": response.status_code if response is not None else None,
-                      "request": {"url": API, "method": "POST", "operation": "getNormaHtmlAccordion", "iunp": identifier}}
-            if raw_file:
-                result.update(raw_html_file=raw_file, raw_sha256=raw_digest,
-                              content_type=response.headers.get("Content-Type", ""))
-            count += 1
-            successes += status == "ok"
-            rejected += status != "ok"
-            if prior is not None and prior.get("status") == "ok" and status != "ok":
-                preserved += 1
-                LOG.warning("%s | refresh %s: %s. Keeping previous usable text. Raw response: %s",
-                            result["numeric_id"], status, reason, raw_file)
-                continue
-            pending.mkdir(parents=True, exist_ok=True)
-            path = pending / f"{result['numeric_id']}.json"
-            atomic_json(path, result)
-            pending_files.append(path)
-            current[identifier] = result
-            LOG.info("%d | %s | %s | %d chars | %s", count, result["numeric_id"],
-                     status, len(text), str(record.get("titulo", ""))[:65])
+                await asyncio.gather(*workers)
+            finally:
+                for task in workers:
+                    task.cancel()
+                await asyncio.gather(*workers, return_exceptions=True)
     finally:
         # Even a later block/error publishes already completed records atomically.
         # If publication itself fails, pending checkpoints are left for recovery.
         if pending_files:
-            atomic_jsonl(args.output, current.values())
+            ordered_ids = dict.fromkeys(chain(existing_order, work))
+            atomic_jsonl(args.output, (current[identifier] for identifier in ordered_ids if identifier in current))
             for path in set(pending_files):
                 path.unlink(missing_ok=True)
             if not any(pending.iterdir()):
                 pending.rmdir()
-    if requested is not None and count < args.limit:
+    if requested is not None and (args.all or count < args.limit):
         unknown = requested - seen_catalog
         if unknown:
             LOG.warning("Requested IDs not found in metadata: %s", ", ".join(sorted(unknown)))
@@ -626,7 +692,8 @@ def main(argv: list[str] | None = None) -> ExtractionResult:
     cat.add_argument("--cache-dir", type=Path, default=Path(config.CACHE_DIR))
     cat.add_argument("--refresh", action="store_true", help="Refetch listing pages (rebuild catalog)")
     cat.add_argument("--max-pages", type=int, default=None, help="Optional short listing test")
-    cat.add_argument("--delay", type=float, default=config.REQUEST_DELAY_SECONDS)
+    delay_help = f"Seconds between request starts (default: %(default)g, minimum: {config.MIN_REQUEST_DELAY_SECONDS:g})"
+    cat.add_argument("--delay", type=float, default=config.REQUEST_DELAY_SECONDS, help=delay_help)
     cat.add_argument("--retries", type=int, default=config.REQUEST_RETRIES, help="Retries for connection failures and transient 5xx responses")
 
     doc = commands.add_parser("texts", help="Extract main legal text for the next unattempted records")
@@ -640,7 +707,7 @@ def main(argv: list[str] | None = None) -> ExtractionResult:
     mode.add_argument("--refresh", action="store_true", help="Refetch selected IDs, including successful records")
     doc.add_argument("--ids", nargs="+", help="Restrict to numeric or encoded instrument IDs")
     doc.add_argument("--raw-dir", type=Path, default=Path(config.RAW_RESPONSE_DIR), help="Raw response backup directory (default: config.RAW_RESPONSE_DIR)")
-    doc.add_argument("--delay", type=float, default=config.REQUEST_DELAY_SECONDS)
+    doc.add_argument("--delay", type=float, default=config.REQUEST_DELAY_SECONDS, help=delay_help)
     doc.add_argument("--retries", type=int, default=config.REQUEST_RETRIES, help="Retries for connection failures and transient 5xx responses")
 
     args = cli.parse_args(argv)
@@ -665,6 +732,6 @@ def main(argv: list[str] | None = None) -> ExtractionResult:
 if __name__ == "__main__":
     try:
         main()
-    except (OSError, ValueError, requests.RequestException, RuntimeError) as exc:
+    except (OSError, ValueError, httpx.HTTPError, RuntimeError) as exc:
         LOG.error("Extraction stopped: %s", exc)
         sys.exit(1)

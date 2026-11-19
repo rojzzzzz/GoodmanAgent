@@ -2,6 +2,8 @@
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
+import tempfile
 import unittest
 from unittest.mock import patch
 import uuid
@@ -10,8 +12,10 @@ import pandas as pd
 import psycopg
 from psycopg import sql
 
-from pipelines.initial import load
+import config
+import test_digesto_extract
 import test_quality
+from pipelines.initial import extract, load, main as pipeline
 
 
 def sample_tables():
@@ -45,6 +49,17 @@ class LoadInputTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load.upload_to_postgres(frames["legal_instruments"], frames["document_nodes"].iloc[:0])
         connect.assert_not_called()
+
+    def test_connection_loss_during_commit_does_not_repeat_the_upload(self):
+        instruments, nodes = sample_tables().values()
+        with patch.object(load.psycopg, "connect") as connect, patch.object(load, "register_vector"):
+            connection = connect.return_value
+            connection.cursor.return_value.__enter__.return_value.fetchone.return_value = (1,)
+            connection.commit.side_effect = psycopg.OperationalError("Connection lost during commit")
+            with self.assertLogs(load.logger, level="ERROR"), self.assertRaises(psycopg.OperationalError):
+                load.upload_to_postgres(instruments, nodes)
+        connect.assert_called_once()
+        connection.commit.assert_called_once()
 
 
 @unittest.skipUnless(os.environ.get("GOODMAN_TEST_POSTGRES_PORT"), "Needs disposable PostgreSQL")
@@ -110,7 +125,8 @@ class LoadPostgresTests(unittest.TestCase):
         instruments, nodes = sample_tables().values()
         child = nodes.copy(deep=True)
         child.loc[0, ["node_key", "parent_node_key", "position", "text", "end_char"]] = ["n2", "n1", 1, "T", 1]
-        load.upload_to_postgres(instruments, pd.concat([child, nodes], ignore_index=True))
+        with patch.object(load, "INSERT_BATCH_SIZE", 1):
+            load.upload_to_postgres(instruments, pd.concat([child, nodes], ignore_index=True))
         with psycopg.connect(**self.credentials) as connection:
             self.assertEqual(connection.execute("SELECT count(*) FROM document_nodes").fetchone()[0], 2)
 
@@ -127,9 +143,94 @@ class LoadPostgresTests(unittest.TestCase):
     def test_duplicate_batch_does_not_overwrite_existing_rows(self):
         instruments, nodes = sample_tables().values()
         load.upload_to_postgres(instruments, nodes)
+        with self.assertRaisesRegex(ValueError, "requires empty"):
+            load.initialize_database(require_empty=True)
         instruments.loc[0, "titulo"] = "Must not replace the original"
         with self.assertRaises(psycopg.errors.UniqueViolation):
             load.upload_to_postgres(instruments, nodes)
         with psycopg.connect(**self.credentials) as connection:
             self.assertEqual(connection.execute("SELECT titulo FROM legal_instruments").fetchall(), [("Test law",)])
             self.assertEqual(connection.execute("SELECT count(*) FROM document_nodes").fetchone()[0], 1)
+
+    def test_schema_upgrade_is_repeatable_and_preserves_existing_rows(self):
+        instruments, nodes = sample_tables().values()
+        load.upload_to_postgres(instruments, nodes)
+        with psycopg.connect(**self.credentials) as connection:
+            connection.execute("ALTER TABLE document_nodes DROP COLUMN embedding")
+        load.initialize_database()
+        load.initialize_database()
+        with psycopg.connect(**self.credentials) as connection:
+            self.assertEqual(connection.execute("SELECT text, embedding FROM document_nodes").fetchall(),
+                             [("Text", None)])
+
+    def test_complete_pipeline_stores_vectors_and_preserves_document_spans(self):
+        instrument = {**test_digesto_extract.instrument(), "categoria": "Ley", "rango": "Ley",
+                      "fechaAprobacion": "04/06/2015", "fechaPublicacion": "09/10/2015"}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = {"OUTPUT_DIR": root, "METADATA_PATH": root / "metadata.jsonl",
+                     "TEXT_PATH": root / "texts.jsonl", "CACHE_DIR": root / "cache",
+                     "RAW_RESPONSE_DIR": root / "raw"}
+            with patch.multiple(config, **paths), patch.object(extract, "DigestoClient", autospec=True) as source, \
+                    patch("openai.OpenAI") as openai, patch("tiktoken.encoding_for_model") as tokenizer:
+                source.return_value.list_page.side_effect = [([instrument], 1), ([], 1)]
+                source.return_value.main_text.return_value = test_digesto_extract.response()
+                tokenizer.return_value.encode.side_effect = lambda text, **kwargs: text.split()
+                api = openai.return_value.__enter__.return_value.embeddings.create
+                api.side_effect = lambda **kwargs: SimpleNamespace(data=[
+                    SimpleNamespace(index=index, embedding=[float(index + 1)] * 1536)
+                    for index in reversed(range(len(kwargs["input"])))
+                ])
+                counts = pipeline.run_initial_pipeline(limit=1)
+        with psycopg.connect(**self.credentials) as connection:
+            rows = connection.execute("""
+                SELECT n.node_type, n.text, i.text, n.start_char, n.end_char,
+                       vector_dims(n.embedding), (n.embedding::real[])[1],
+                       n.embedding <=> n.embedding
+                FROM document_nodes n JOIN legal_instruments i ON i.id = n.legal_instrument_id
+                ORDER BY n.position
+            """).fetchall()
+        self.assertEqual(counts, {"legal_instruments": 1, "document_nodes": len(rows)})
+        article_index = 0
+        for kind, text, document, start, end, dimensions, value, distance in rows:
+            self.assertEqual(text, document[start:end])
+            if kind == "article":
+                article_index += 1
+                self.assertEqual((dimensions, value), (1536, float(article_index)))
+                self.assertAlmostEqual(distance, 0)
+            else:
+                self.assertIsNone(dimensions)
+        self.assertGreater(article_index, 0)
+
+    def test_wrong_vector_dimension_rolls_back_both_tables(self):
+        instruments, nodes = sample_tables().values()
+        nodes["embedding"] = [[1.0, 2.0]]
+        with self.assertRaises(psycopg.errors.DataException):
+            load.upload_to_postgres(instruments, nodes)
+        with psycopg.connect(**self.credentials) as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM legal_instruments").fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT count(*) FROM document_nodes").fetchone()[0], 0)
+
+    def test_connection_loss_before_commit_reuses_the_prepared_rows(self):
+        instruments, nodes = sample_tables().values()
+        execute_many = psycopg.Cursor.executemany
+        terminated = False
+
+        def disconnect_once(cursor, statement, rows):
+            nonlocal terminated
+            execute_many(cursor, statement, rows)
+            if not terminated:
+                terminated = True
+                with psycopg.connect(**self.credentials, autocommit=True) as observer:
+                    self.assertEqual(observer.execute("SELECT count(*) FROM document_nodes").fetchone(), (0,))
+                    self.assertTrue(observer.execute("SELECT pg_terminate_backend(%s, 5000)",
+                                                     (cursor.connection.info.backend_pid,)).fetchone()[0])
+                cursor.execute("SELECT 1")
+
+        with patch.object(psycopg.Cursor, "executemany", disconnect_once), patch.object(load, "sleep"):
+            counts = load.upload_to_postgres(instruments, nodes)
+        self.assertTrue(terminated)
+        self.assertEqual(counts, {"legal_instruments": 1, "document_nodes": 1})
+        with psycopg.connect(**self.credentials) as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM legal_instruments").fetchone(), (1,))
+            self.assertEqual(connection.execute("SELECT count(*) FROM document_nodes").fetchone(), (1,))

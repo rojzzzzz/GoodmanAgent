@@ -1,4 +1,4 @@
-from pydantic_ai import Agent
+from pydantic_ai import Agent, UsageLimits
 from dotenv import load_dotenv
 
 load_dotenv()  
