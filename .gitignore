@@ -18,6 +18,8 @@ htmlcov/
 # Generated pipeline artifacts
 /output/
 /pipelines/initial/output/
+/docs/
+
 
 # Editor and operating system files
 .vscode/

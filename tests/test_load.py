@@ -16,6 +16,7 @@ import config
 import test_digesto_extract
 import test_quality
 from pipelines.initial import extract, load, main as pipeline
+from tools.tools import retrieve
 
 
 def sample_tables():
@@ -162,6 +163,62 @@ class LoadPostgresTests(unittest.TestCase):
         with psycopg.connect(**self.credentials) as connection:
             self.assertEqual(connection.execute("SELECT text, embedding FROM document_nodes").fetchall(),
                              [("Text", None)])
+
+    def test_retrieval_combines_rankings_and_resolves_numbered_citations(self):
+        instruments, nodes = sample_tables().values()
+        instrument_rows = []
+        node_rows = []
+        query_vector = [1.0] + [0.0] * 1535
+        perpendicular = [0.0, 1.0] + [0.0] * 1534
+        for source_id, kind, title, label, text, embedding in (
+            ("agreement", "Decreto Ejecutivo", "Decreto", "12 bis", "Ruido.", perpendicular),
+            ("code", "Código", "Código de convivencia", "12º bis", "Se prohíben ruidos nocturnos.", query_vector),
+            ("long", "Ley", "Protección ambiental", "5", "Ruido nocturno persistente.", None),
+            ("title", "Ley", "Pesca artesanal", "1", "Disposiciones generales.", None),
+            ("amendment", "Ley", "Reforma sobre pesca artesanal", "1", "Pesca artesanal en cooperativas.", None),
+        ):
+            instrument_rows.append({
+                **instruments.iloc[0].to_dict(),
+                "source_id": source_id, "rango": kind, "titulo": title, "numero": "42",
+                "text": text, "text_chars": len(text),
+            })
+            node_rows.append({
+                **nodes.iloc[0].to_dict(), "source_id": source_id, "node_type": "article",
+                "label": label, "text": text, "end_char": len(text), "embedding": embedding,
+            })
+        load.upload_to_postgres(pd.DataFrame(instrument_rows), pd.DataFrame(node_rows))
+
+        with patch.object(config, "DB_CREDENTIALS", self.credentials), \
+                patch("tools.tools.OpenAI") as client:
+            embed = client.return_value.__enter__.return_value.embeddings.create
+            embed.return_value = SimpleNamespace(data=[SimpleNamespace(embedding=query_vector)])
+            exact = retrieve("¿Qué dice el artículo 12 bis de la Ley N.º 42?")
+            self.assertEqual([row["source_id"] for row in exact], ["code"])
+            self.assertEqual(exact[0]["text"], "Se prohíben ruidos nocturnos.")
+            self.assertIsNone(exact[0]["score"])
+            self.assertEqual(retrieve("Ley 42, art. 13"), [])
+            embed.assert_not_called()
+
+            results = retrieve("ruido nocturno", limit=3)
+            self.assertEqual(results[0]["source_id"], "code")
+            self.assertEqual(results[0]["distance"], 0)
+            self.assertEqual({row["source_id"] for row in results}, {"agreement", "code", "long"})
+            self.assertIsNone(next(row["distance"] for row in results if row["source_id"] == "long"))
+            self.assertEqual(
+                [row["source_id"] for row in retrieve("pesca artesanal", semantic=False)],
+                ["title", "amendment"],
+            )
+            self.assertEqual(retrieve("de y", semantic=False), [])
+            embed.assert_called_once_with(
+                model=config.EMBEDDING_MODEL,
+                dimensions=config.EMBEDDING_DIMENSIONS,
+                input="ruido nocturno",
+            )
+
+            with psycopg.connect(**self.credentials, autocommit=True) as connection:
+                index_sql = config.ROOT_DIR / "database" / "retrieval_index.sql"
+                connection.execute(index_sql.read_text(encoding="utf-8"))
+            self.assertEqual(retrieve("ruido nocturno", limit=3), results)
 
     def test_complete_pipeline_stores_vectors_and_preserves_document_spans(self):
         instrument = {**test_digesto_extract.instrument(), "categoria": "Ley", "rango": "Ley",

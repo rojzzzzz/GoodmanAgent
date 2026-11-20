@@ -93,4 +93,16 @@ ALTER TABLE document_nodes ADD COLUMN IF NOT EXISTS embedding VECTOR(1536);
 CREATE INDEX IF NOT EXISTS document_nodes_parent_idx
     ON document_nodes (legal_instrument_id, parent_node_key);
 
+CREATE INDEX IF NOT EXISTS document_nodes_article_text_idx
+    ON document_nodes USING GIN (to_tsvector('pg_catalog.spanish', text))
+    WHERE node_type = 'article';
+
+CREATE INDEX IF NOT EXISTS legal_instruments_title_search_idx
+    ON legal_instruments USING GIN (to_tsvector('pg_catalog.spanish', titulo))
+    WHERE extraction_status = 'ok';
+
+CREATE INDEX IF NOT EXISTS legal_instruments_number_idx
+    ON legal_instruments (numero)
+    WHERE extraction_status = 'ok';
+
 COMMIT;
