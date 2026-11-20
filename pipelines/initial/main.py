@@ -14,6 +14,7 @@ import config
 from pipelines.initial.extract import run_extraction, validate_request_delay
 from pipelines.initial.embedding import embedder
 from pipelines.initial.load import initialize_database, upload_to_postgres
+import datetime
 from pipelines.initial.transform import extract_data
 
 
@@ -56,10 +57,19 @@ def run_initial_pipeline(*, limit: int | None = None, delay: float | None = None
     logger.info("Loading both tables into PostgreSQL")
     counts = upload_to_postgres(tables["legal_instruments"], nodes)
     logger.info("Initial pipeline completed: %s", counts)
+
+    database_state = {
+        "State": "Loaded",
+        "Extraction_Timestamp": datetime.now().isoformat(),
+    }
+
+    with config.DATABASE_STATE.open("w", encoding="utf-8") as file:
+        json.dump(database_state, file)
+
     return counts
 
 
-def main(argv: list[str] | None = None) -> dict[str, int]:
+def execute(argv: list[str] | None = None) -> dict[str, int]:
     """Parse the text-fetch limit, configure logging, and run the initial pipeline."""
     parser = argparse.ArgumentParser(description="Load the initial Digesto dataset into PostgreSQL")
     parser.add_argument("--limit", type=int, default=None,
@@ -78,6 +88,8 @@ def main(argv: list[str] | None = None) -> dict[str, int]:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     return run_initial_pipeline(limit=args.limit, delay=args.delay)
 
-
-if __name__ == "__main__":
-    main()
+def main():
+    if config.DATABASE_STATE.exists():
+        return
+    else:
+        execute()

@@ -17,6 +17,7 @@ CACHE_DIR = OUTPUT_DIR / "digesto_cache"
 RAW_RESPONSE_DIR = CACHE_DIR / "main_responses"
 CONTRACT_PATH = PROJECT_DIR / "data_contract.yaml"
 QUALITY_REPORT_FILENAME = "quality_report.json"
+DATABASE_STATE = ROOT_DIR / "database.json"
 
 TEXT_BATCH_SIZE = 25
 REQUEST_DELAY_SECONDS = 1.0

@@ -4,19 +4,12 @@ from pydantic_ai.common_tools.duckduckgo import duckduckgo_search_tool
 from pydantic_ai.common_tools.web_fetch import web_fetch_tool
 from pydantic_ai import Agent, UsageLimits
 from openai import OpenAI, OpenAIError
-from psycopg.rows import dict_row
+
 from dotenv import load_dotenv
 from typing import TypedDict
 from datetime import date
 from typing import Any
-import unicodedata
 import logging
-import re
-
-
-
-
-import psycopg
 
 
 
@@ -39,9 +32,19 @@ def retrieve(
     embeddings are unavailable, text search still works. Returned article
     text is verbatim. The distance is present when both vectors exist, and
     score is the fused rank score for a topical query.
+
+    Args:
+        query (str): The query string to search for.
+        limit (int | None): The maximum number of results to return. If None, defaults to a configured value.
+        semantic (bool): Whether to use semantic search that returns the most relevant results. Always select if there's no explicit citation or 
+        if the query is not a single article lookup.
+                
     """
+    from psycopg.rows import dict_row
+    import unicodedata
     import config
     import psycopg
+    import re
 
     _VECTOR_SHORTLIST_SIZE = 1000
     _VECTOR_INDEX = "document_nodes_embedding_hamming_idx"
@@ -231,8 +234,10 @@ def retrieve(
     _HYBRID_INDEXED_SQL = _HYBRID_SQL.format(semantic_sql=_INDEXED_SEMANTIC_SQL, result_columns=_RESULT_COLUMNS)
 
 
-    def parse_citation(query: str) -> dict[str, str | None] | None:
-        """Recognize a single numbered citation expressed as a lookup."""
+    def _parse_citation(query: str) -> dict[str, str | None] | None:
+        """Helper function that checks if a query is a citation. It can return a dict with the parse citation or None if the query
+        is not a citation"""
+
         query = re.sub(r"(?<=[0-9])\.(?=[º°])", "", query.strip("¿?¡!. "))
         for pattern in _CITATIONS:
             match = pattern.fullmatch(query)
@@ -276,7 +281,7 @@ def retrieve(
     if not any(character.isalnum() for character in query):
         return []
 
-    citation = parse_citation(query)
+    citation = _parse_citation(query)
     if citation is not None:
         statement = _CITATION_SQL
         params = {**citation, "limit": limit}
@@ -290,8 +295,10 @@ def retrieve(
         }
 
     with psycopg.connect(**config.DB_CREDENTIALS, row_factory=dict_row) as connection:
+
         if (citation is None and params["embedding"] is not None
                 and params["candidates"] < _VECTOR_SHORTLIST_SIZE and has_vector_index(connection)):
+            
             connection.execute("SELECT set_config('hnsw.ef_search', %s, true)",
                                (str(_VECTOR_SHORTLIST_SIZE),))
             statement = _HYBRID_INDEXED_SQL
@@ -311,12 +318,12 @@ def get_article_context(source_id: str, node_key: str):
             cur.execute("""
                 SELECT 
                     i.categoria, i.rango,
-                    n.node_type, n.label, n.source_label,
+                    n.node_type, n.label, n.source_label
                     
                 FROM document_nodes n
                 JOIN legal_instruments i ON n.legal_instrument_id = i.id
                 WHERE i.source_id = %s
-            """, (source_id))
+            """, (source_id,))
             return cur.fetchall()
 
 def calculator(a: float, b: float, operation: str) -> float:
@@ -342,8 +349,9 @@ def calculator(a: float, b: float, operation: str) -> float:
     else:
         raise ValueError("Invalid operation. Please use 'add', 'subtract', 'multiply', or 'divide'.")
 
-def verify_response(response: str, query: str) -> dict[str, Any]:
-    """Deplos a subagent that verifies if the response is relevant to the query
+async def verify_response(response: str, query: str) -> dict[str, Any]:
+    """Deploy a subagent that verifies if the response is relevant to the query. It is useful at the moment to decide wether a final response
+    has been reached. If the diagnostic is negative, then the agent should continue to use tools to find a better answer
     
     Args:
         response (str): The response to verify.
@@ -363,7 +371,7 @@ def verify_response(response: str, query: str) -> dict[str, Any]:
         output_type=VerificationResult
     )
 
-    result = agent.run_sync(f"Query: {query}\nResponse: {response}\nIs the response relevant to the query? Please provide a boolean answer and a brief explanation.",
+    result = await agent.run_async(f"Query: {query}\nResponse: {response}\nIs the response relevant to the query? Please provide a boolean answer and a brief explanation.",
                             usage_limits=UsageLimits(total_tokens_limit=1200, request_limit=4))
 
     return result.output
@@ -378,7 +386,7 @@ def verify_vigencia(source_id: str, article: str | None = None) -> dict[str, str
     checked_at records the lookup time; it is not the legal effective date.
     """
     from html import unescape
-
+    import re
     from bs4 import BeautifulSoup
     import httpx
 

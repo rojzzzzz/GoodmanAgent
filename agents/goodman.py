@@ -22,6 +22,9 @@ def create_agent():
             3. Evaluate the tool results.
             4. Continue using tools if needed.
             5. Provide the final answer.
+
+            Do not hallucinate information. Always return the answer in a clear and concise manner, and provide references to the sources
+            used when applicable. If you cannot find the answer, even after using the tools, respond with "I don't know". 
             """
         ),
         tools = TOOLS,
@@ -31,8 +34,14 @@ def create_agent():
 
 agent = create_agent()
 
+def run_initial_load():
+    from pipelines.initial.main import main
+    main()
+
 async def main():
-    async with agent.iter("Mi vecino hace mucho ruido por las noches y no se que opcion legal tengo para callarlo") as run:
+
+    prompt = input("Enter your question:")
+    async with agent.iter(prompt) as run:
 
         node = run.next_node
 

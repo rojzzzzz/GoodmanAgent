@@ -16,7 +16,7 @@ import config
 import test_digesto_extract
 import test_quality
 from pipelines.initial import extract, load, main as pipeline
-from tools.tools import retrieve
+from tools.tools import get_article_context, retrieve
 
 
 def sample_tables():
@@ -163,6 +163,13 @@ class LoadPostgresTests(unittest.TestCase):
         with psycopg.connect(**self.credentials) as connection:
             self.assertEqual(connection.execute("SELECT text, embedding FROM document_nodes").fetchall(),
                              [("Text", None)])
+
+    def test_article_context_binds_a_single_source_id(self):
+        load.upload_to_postgres(*sample_tables().values())
+
+        with patch.object(config, "DB_CREDENTIALS", self.credentials):
+            self.assertEqual(get_article_context("MQ==", "n1"), [("Ley", "Ley", "article", "1", "Art. 1")])
+            self.assertEqual(get_article_context("Mg==", "n1"), [])
 
     def test_retrieval_combines_rankings_and_resolves_numbered_citations(self):
         instruments, nodes = sample_tables().values()
