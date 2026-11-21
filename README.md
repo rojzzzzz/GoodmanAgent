@@ -4,6 +4,8 @@
 
 Goodman is an AI assistant for exploring Nicaraguan law. It combines legal retrieval with a ReAct agent that can investigate a question, use tools, and cite sources when available.
 
+Version: 0.5
+
 ## Retrieval-augmented generation (RAG)
 
 Goodman searches a PostgreSQL corpus of Digesto legal instruments and articles. Explicit citations use an instrument and article lookup; topical queries combine article text, instrument titles, and vector similarity. If query embeddings are unavailable, text search remains available. [View the diagram](docs/goodman-retrieval-flow.png)
