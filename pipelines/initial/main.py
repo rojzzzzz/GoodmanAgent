@@ -92,4 +92,5 @@ def main():
     if config.DATABASE_STATE.exists():
         return
     else:
+        print("Creating initial database...")
         execute()

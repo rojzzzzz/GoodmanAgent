@@ -38,17 +38,45 @@ def run_initial_load():
     from pipelines.initial.main import main
     main()
 
-async def main():
+async def main():   
+    print("=" * 20)
 
-    prompt = input("Enter your question:")
-    async with agent.iter(prompt) as run:
+    print(r"""
+    /$$$$$$                            /$$
+    /$$__  $$                          | $$
+    | $$  \__/  /$$$$$$   /$$$$$$   /$$$$$$$ /$$$$$$/$$$$   /$$$$$$  /$$$$$$$
+    | $$ /$$$$ /$$__  $$ /$$__  $$ /$$__  $$| $$_  $$_  $$ |____  $$| $$__  $$
+    | $$|_  $$| $$  \ $$| $$  \ $$| $$  | $$| $$ \ $$ \ $$  /$$$$$$$| $$  \ $$
+    | $$  \ $$| $$  | $$| $$  | $$| $$  | $$| $$ | $$ | $$ /$$__  $$| $$  | $$
+    |  $$$$$$/|  $$$$$$/|  $$$$$$/|  $$$$$$$| $$ | $$ | $$|  $$$$$$$| $$  | $$
+    \______/  \______/  \______/ \_______/|__/ |__/ |__/ \_______/|__/  |__/
+    """)
 
-        node = run.next_node
+    print("=" * 20)
+    print()
 
-        while not isinstance(node, End):
-            print("Executing:", type(node).__name__)
-            node = await run.next(node)
+    conversation = None
+    while True:
 
-        print(run.result.output)
+        prompt = input("\nYou: ")\
+        
+        if prompt.lower() in ["exit", "quit"]:
+            print("Exiting...")
+            break
+
+        
+        async with agent.iter(prompt, conversation=conversation) as run:
+
+            node = run.next_node
+
+            print("\nGoodman is thinking...\n")
+            while not isinstance(node, End):
+                print("Executing:", type(node).__name__)
+                node = await run.next(node)
+
+            print("\nResponse:\n")
+            print(run.result.output)
+            conversation = run.result.conversation
+            print()
 
 asyncio.run(main())

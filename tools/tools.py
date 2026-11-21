@@ -2,9 +2,7 @@
 
 from pydantic_ai.common_tools.duckduckgo import duckduckgo_search_tool
 from pydantic_ai.common_tools.web_fetch import web_fetch_tool
-from pydantic_ai import Agent, UsageLimits
 from openai import OpenAI, OpenAIError
-
 from dotenv import load_dotenv
 from typing import TypedDict
 from datetime import date
